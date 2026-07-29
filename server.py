@@ -19,14 +19,14 @@ from aiohttp import web
 # === CONFIG ===
 TCP_PORT = 6500
 DASH_PORT = int(os.environ.get("GERT_DASH_PORT", "8650"))
-SERVER_IP = os.environ.get("GERT_SERVER_IP", "0.0.0.0")
+SERVER_IP = os.environ.get("GERT_SERVER_IP", "192.168.1.113")
 WEBPOSTO_BASE = "https://web.qualityautomacao.com.br/INTEGRACAO"
 SYNC_PRICES_INTERVAL = 300
 SYNC_CATALOG_INTERVAL = 1800
 GIF_ROTATION_INTERVAL = 30
 LOG_DIR = Path(__file__).parent / "logs"
 GIF_DIR = Path(__file__).parent / "gifs"
-EMPRESAS = json.loads(os.environ.get("GERT_EMPRESAS", "[1]"))
+EMPRESAS = json.loads(os.environ.get("GERT_EMPRESAS", "[7806]"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,7 +48,7 @@ class ServerState:
         self.last_catalog_sync = 0
         self.sync_errors = []
         self.http_session = None  # shared aiohttp session for on-demand lookups
-        self.no_price_confirmed = {}  # produtoCodigo -> timestamp (confirmed precoVenda=0 or inactive)
+        self.no_price_confirmed = {}  # "produtoCodigo_empresa" -> timestamp (confirmed precoVenda=0 or inactive)
         self.progressive_cursor = 0   # cursor for progressive price sync
         self.stats = {
             "total_queries": 0,
@@ -229,8 +229,9 @@ async def fetch_price_on_demand(produto_codigo, empresa):
     if not token or not state.http_session:
         return None
 
-    # Negative cache: skip if we already confirmed no price within the last hour
-    cached_at = state.no_price_confirmed.get(produto_codigo)
+    # Negative cache: skip if we already confirmed no price for THIS empresa within the last hour
+    cache_key = f"{produto_codigo}_{empresa}"
+    cached_at = state.no_price_confirmed.get(cache_key)
     if cached_at and (time.time() - cached_at) < 3600:
         return 0.0
 
@@ -267,18 +268,18 @@ async def fetch_price_on_demand(produto_codigo, empresa):
                             state.products[bc]["preco"] = price
                 state.stats["on_demand_lookups"] += 1
                 # Clear negative cache if it was there
-                state.no_price_confirmed.pop(produto_codigo, None)
+                state.no_price_confirmed.pop(cache_key, None)
                 log.info(f"On-demand price: produtoCodigo={produto_codigo} -> R${price:.2f}")
                 return price
             else:
                 # Product exists in ERP but has no sale price (inactive or zero price)
-                state.no_price_confirmed[produto_codigo] = time.time()
+                state.no_price_confirmed[cache_key] = time.time()
                 state.stats["on_demand_no_price"] += 1
                 log.info(f"On-demand: produtoCodigo={produto_codigo} has no price (precoVenda={pv}, ativo={ativo})")
                 return 0.0
         else:
             # Product not registered in PRODUTO_EMPRESA for this empresa
-            state.no_price_confirmed[produto_codigo] = time.time()
+            state.no_price_confirmed[cache_key] = time.time()
             state.stats["on_demand_no_price"] += 1
             log.info(f"On-demand: produtoCodigo={produto_codigo} not found in PRODUTO_EMPRESA")
             return 0.0
@@ -301,12 +302,13 @@ async def sync_prices_progressive(session):
         if not token:
             continue
 
-        # Collect produtoCodigo entries without price for this empresa
+        # Collect ALL produtoCodigo entries without price (not just this empresa's)
+        # A product may be inactive in its indexed empresa but active in another
         pending = []
         for pc, info in state.by_codigo.items():
-            if info.get("preco") is None and info.get("empresa", empresa) == empresa:
+            if info.get("preco") is None:
                 # Skip recently confirmed no-price (negative cache)
-                cached_at = state.no_price_confirmed.get(pc)
+                cached_at = state.no_price_confirmed.get(f"{pc}_{empresa}")
                 if cached_at and (time.time() - cached_at) < 3600:
                     continue
                 pending.append(pc)
@@ -358,12 +360,12 @@ async def sync_prices_progressive(session):
                                 if bc and bc in state.products:
                                     state.products[bc]["preco"] = price
                         fetched += 1
-                        state.no_price_confirmed.pop(pc, None)
+                        state.no_price_confirmed.pop(f"{pc}_{empresa}", None)
                     else:
-                        state.no_price_confirmed[pc] = time.time()
+                        state.no_price_confirmed[f"{pc}_{empresa}"] = time.time()
                         no_price += 1
                 else:
-                    state.no_price_confirmed[pc] = time.time()
+                    state.no_price_confirmed[f"{pc}_{empresa}"] = time.time()
                     no_price += 1
                 consecutive_errors = 0
             except Exception as e:
@@ -480,7 +482,7 @@ async def handle_terminal(reader, writer):
 
         if not is_g2e:
             # G2S: send welcome message + initial GIF
-            writer.write(build_mesg("SEU POSTO", "CONSULTE AQUI!", 5))
+            writer.write(build_mesg("POSTO SCURSEL", "CONSULTE AQUI!", 5))
             await writer.drain()
             state.stats["mesg_sends"] += 1
             gif_files = sorted(GIF_DIR.glob("*.gif"))
@@ -522,22 +524,36 @@ async def handle_terminal(reader, writer):
                     resp = format_price_response(product["nome"], product["preco"])
                     log.info(f"HIT: {barcode} -> {product['nome']} R${product['preco']:.2f}")
                 elif product:
-                    # Product known but no price — try on-demand lookup
+                    # Product known but no price — try on-demand lookup across ALL empresas
                     pc = product.get("produtoCodigo")
-                    emp = product.get("empresa", EMPRESAS[0] if EMPRESAS else 1)
+                    emp_primary = product.get("empresa", EMPRESAS[0] if EMPRESAS else 7806)
                     price = None
+                    found_empresa = None
                     if pc:
-                        price = await fetch_price_on_demand(pc, emp)
+                        # Try primary empresa first
+                        price = await fetch_price_on_demand(pc, emp_primary)
+                        if price is not None and price > 0:
+                            found_empresa = emp_primary
+                        else:
+                            # Product may be inactive in primary empresa but active in another
+                            for alt_emp in EMPRESAS:
+                                if alt_emp == emp_primary:
+                                    continue
+                                price = await fetch_price_on_demand(pc, alt_emp)
+                                if price is not None and price > 0:
+                                    found_empresa = alt_emp
+                                    break
                     if price is not None and price > 0:
                         product["preco"] = price
+                        product["empresa"] = found_empresa
                         state.stats["hits"] += 1
                         resp = format_price_response(product["nome"], price)
-                        log.info(f"HIT (on-demand): {barcode} -> {product['nome']} R${price:.2f}")
+                        log.info(f"HIT (on-demand emp={found_empresa}): {barcode} -> {product['nome']} R${price:.2f}")
                     elif price == 0.0:
-                        # Confirmed: product has no price in ERP (inactive/zero)
+                        # Confirmed: product has no price in ANY empresa
                         state.stats["hits"] += 1
                         resp = format_price_response(product["nome"], None)
-                        log.info(f"HIT (confirmed no price): {barcode} -> {product['nome']}")
+                        log.info(f"HIT (confirmed no price in all empresas): {barcode} -> {product['nome']}")
                     else:
                         # API call failed — show SEM PRECO but will retry on next bip
                         state.stats["hits"] += 1
@@ -668,7 +684,7 @@ h2 {{ color: #c9d1d9; margin: 20px 0 10px; font-size: 1.1em; }}
 </head>
 <body>
 <h1>Gertec Busca Preco - Server</h1>
-<p class="subtitle">Seu Posto | Uptime: {hours}h {mins}m | TCP {TCP_PORT} / HTTP {DASH_PORT}</p>
+<p class="subtitle">Posto Scursel | Uptime: {hours}h {mins}m | TCP {TCP_PORT} / HTTP {DASH_PORT}</p>
 <section class="setup">
 <h2>Como configurar o terminal Gertec</h2>
 <p class="setup-intro">No menu de rede do Gertec, configure o servidor de consulta usando TCP:</p>
