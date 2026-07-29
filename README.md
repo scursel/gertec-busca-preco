@@ -20,6 +20,150 @@ Servidor Linux que substitui o app Java dos terminais de consulta **Gertec G2 / 
 4. **Protocolo TCP** — handshake `#ok` → `#bpg2s`/`#bpg2e`, keep-alive `#alwayslive`, consulta `#<barcode>` → `#NOME|PRECO` ou `#nfound`
 5. **Propaganda** — GIFs rotativos em terminais G2S (via TCP `#gif`); mensagens de texto em G2E (via interface web do terminal)
 
+## Para agentes de código — instruções de implementação
+
+Se você é um agente AI ou desenvolvedor implementando este projeto, siga estas instruções na ordem:
+
+### 1. Setup do ambiente
+
+```bash
+git clone https://github.com/scursel/gertec-busca-preco.git
+cd gertec-busca-preco
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+```
+
+### 2. Variáveis obrigatórias no `.env`
+
+Pelo menos uma empresa deve ter token configurado:
+
+```env
+WEBPOSTO_TOKEN_1=seu-token-aqui
+GERT_EMPRESAS=[1]
+```
+
+Tokens são obtidos no ERP WebPosto: Configurações → Integração. Para múltiplas empresas, configure um token por empresa:
+
+```env
+WEBPOSTO_TOKEN_1=token-empresa-1
+WEBPOSTO_TOKEN_2=token-empresa-2
+GERT_EMPRESAS=[1,2]
+```
+
+### 3. Executar localmente
+
+```bash
+source .env
+python3 server.py
+```
+
+O servidor escuta:
+- **TCP porta 6500** — protocolo Gertec (terminais físicos)
+- **HTTP porta 8650** — dashboard web
+
+### 4. Arquitetura
+
+```
+server.py
+├── sync_catalog()        # Catálogo PRODUTO via GRUPO (bypass limite 2000)
+├── sync_prices_bulk()    # Preços PRODUTO_EMPRESA (2000 mais recentes)
+├── sync_prices_progressive()  # Preços dos demais (~12K produtos, 4h cobertura)
+├── fetch_price_on_demand()    # Lookup em tempo real por empresa
+└── handle_terminal()     # Protocolo TCP Gertec
+```
+
+### 5. Endpoint PRODUTO_EMPRESA — documentação
+
+⚠️ `PRODUTO_EMPRESA` **não está no inventário oficial** de endpoints da API WebPosto (37 endpoints documentados). É um endpoint funcional mas não documentado pela Quality Automação. Se a API parar de responder, esteja preparado para fallback.
+
+**Funcionalidade:** retorna preço de venda, custo, estoque e status (ativo/inativo) por produto e empresa.
+
+**Parâmetros:**
+```
+GET /INTEGRACAO/PRODUTO_EMPRESA?CHAVE=<token>&empresaCodigo=<emp>&limite=1&produtoCodigo=<cod>
+```
+
+**Resposta típica:**
+```json
+{
+  "resultados": [{
+    "produtoCodigo": 1878759,
+    "precoVenda": 21.99,
+    "precoCusto": 10.93,
+    "estoqueQtde": 1.0,
+    "ativo": true,
+    "ultimaAlteracao": "2026-06-23T10:45:44"
+  }]
+}
+```
+
+### 6. Pitfalls críticos
+
+| Problema | Causa | Solução |
+|----------|-------|---------|
+| Produto retorna SEM PRECO no terminal | Cache negativo chaveado sem empresa | Usar `produtoCodigo_empresa` como chave (v1.1+) |
+| Barcode indexado na empresa errada | Sync de catálogo usa a última empresa do loop | On-demand tenta TODAS as empresas (v1.1+) |
+| Progressive sync não cobre produto | Filtro por empresa no sync progressivo | Remover filtro, verificar todas as empresas (v1.1+) |
+| PRODUTO_EMPRESA ignora `produtoCodigoBarra` | API só aceita `produtoCodigo` | Mapear barcode → código localmente |
+| `PRODUTO` ignora filtro `codigo` | Parâmetro não funciona | Buscar por `grupoCodigo` ou varrer catálogo |
+| `PRODUTO` ignora filtro `nome` | Busca retorna sempre os mesmos 3 resultados | Filtrar localmente após sync |
+| Limite 2000 em PRODUTO_EMPRESA | HTTP 400 se limite > 2000 | Usar `limite=2000` |
+
+### 7. Multi-empresa: como funciona
+
+1. **Sync de catálogo** (`PRODUTO`): busca por GRUPO, indexa `produtoCodigo → barcode(s)`. O catálogo é compartilhado — mesmo código em todas as empresas.
+
+2. **Sync de preços** (`PRODUTO_EMPRESA`): bulk (2000 por empresa) + progressive sync (200 por ciclo, 5 min). Cada empresa tem seus próprios preços/estoque/status.
+
+3. **Lookup sob demanda** (TCP `#barcode`): quando o terminal bipa um produto sem preço:
+   - Busca empresa primária (a indexada no cache)
+   - Se retorna `preco=0` ou `ativo=False`, tenta **todas as outras empresas**
+   - Primeiro preço > 0 encontrado é cacheado e retornado
+   - Se nenhuma empresa tem preço, marca como `confirmado_sem_preco` (não re-consulta por 1h)
+
+4. **Cache negativo**: chaveado por `produtoCodigo_empresa` (não apenas `produtoCodigo`). Produto inativo na empresa A não bloqueia consultas na empresa B.
+
+### 8. Protocolo TCP Gertec
+
+```python
+# Handshake (servidor inicia)
+server → terminal:  b"#ok"
+terminal → server:  b"#bpg2s|4.3.2 S"  # G2S ou #bpg2e para G2E
+server → terminal:  b"#alwayslive" + dados do GIF (G2S) ou vazio (G2E)
+
+# Consulta
+terminal → server:  b"#7891234567890"  # barcode
+server → terminal:  b"#PRODUTO EXEMPLO|12.90"  # encontrado com preço
+                  ou b"#PRODUTO EXEMPLO|SEM PRECO"  # encontrado sem preço
+                  ou b"#nfound"  # barcode não cadastrado
+
+# Keep-alive (após 120s sem dados)
+server → terminal:  b"#live?"
+terminal → server:  b"#live"
+```
+
+### 9. Dashboard HTTP (porta 8650)
+
+| Endpoint | Método | Descrição |
+|----------|--------|-----------|
+| `/` | GET | Dashboard HTML |
+| `/api` | GET | JSON com stats, cache, terminais, consultas |
+| `/lookup?barcode=X` | GET | Buscar barcode no cache (para debug) |
+| `/gifs` | GET | Listar GIFs de propaganda |
+| `/upload-gif` | POST | Upload de GIF (multipart) |
+
+### 10. systemd (produção)
+
+```bash
+cp gertec-server.service ~/.config/systemd/user/
+# Editar EnvironmentFile se necessário
+systemctl --user daemon-reload
+systemctl --user enable --now gertec-server.service
+```
+
+O watchdog `watchdog_gertec_server.py` pode ser configurado como cron a cada 5 min para healthcheck automático.
+
 ## Modelos suportados
 
 | Modelo | Handshake | GIF via TCP | Mensagem via TCP | Config propaganda |
