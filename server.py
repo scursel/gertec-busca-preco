@@ -45,7 +45,7 @@ WEBPOSTO_BASE = os.environ.get(
 )
 
 # Empresas (códigos numéricos). Cada uma precisa de WEBPOSTO_TOKEN_<codigo> no env.
-EMPRESAS = json.loads(os.environ.get("GERT_EMPRESAS", "[7806]"))
+EMPRESAS = json.loads(os.environ.get("GERT_EMPRESAS", "[1]"))
 
 SYNC_PRICES_INTERVAL = int(os.environ.get("GERT_SYNC_PRICES_SEC", "300"))
 SYNC_CATALOG_INTERVAL = int(os.environ.get("GERT_SYNC_CATALOG_SEC", "1800"))
@@ -458,7 +458,7 @@ async def handle_terminal(reader, writer):
                 elif product:
                     # Produto conhecido mas sem preço — buscar sob demanda
                     pc = product.get("produtoCodigo")
-                    emp = product.get("empresa", EMPRESAS[0] if EMPRESAS else 7806)
+                    emp = product.get("empresa", EMPRESAS[0] if EMPRESAS else 1)
                     price = None
                     if pc:
                         price = await fetch_price_on_demand(pc, emp)

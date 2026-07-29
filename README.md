@@ -53,8 +53,8 @@ cp .env.example .env
 
 | Variável | Default | Descrição |
 |----------|---------|-----------|
-| `WEBPOSTO_TOKEN_<EMPRESA>` | — | Token de integração (ex: `WEBPOSTO_TOKEN_7806=*** |
-| `GERT_EMPRESAS` | `[7806]` | Lista JSON de códigos de empresa |
+| `WEBPOSTO_TOKEN_<EMPRESA>` | — | Token de integração (ex: `WEBPOSTO_TOKEN_1=*** |
+| `GERT_EMPRESAS` | `[1]` | Lista JSON de códigos de empresa |
 | `GERT_TCP_PORT` | `6500` | Porta TCP do protocolo Gertec |
 | `GERT_DASH_PORT` | `8650` | Porta HTTP do dashboard |
 | `GERT_SERVER_IP` | `0.0.0.0` | IP exibido nas instruções do dashboard |
