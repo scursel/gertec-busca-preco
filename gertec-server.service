@@ -1,0 +1,15 @@
+[Unit]
+Description=Gertec Busca Preço Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/gertec-busca-preco
+EnvironmentFile=%h/gertec-busca-preco/.env
+ExecStart=%h/gertec-busca-preco/.venv/bin/python3 %h/gertec-busca-preco/server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
