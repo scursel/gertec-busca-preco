@@ -53,11 +53,11 @@ cp .env.example .env
 
 | Variável | Default | Descrição |
 |----------|---------|-----------|
-| `WEBPOSTO_TOKEN_<EMPRESA>` | — | Token de integração (ex: `WEBPOSTO_TOKEN_1=*** |
-| `GERT_EMPRESAS` | `[1]` | Lista JSON de códigos de empresa |
+| `WEBPOSTO_TOKEN_<EMPRESA>` | — | Token de integração. Crie uma variável por empresa (ex: `WEBPOSTO_TOKEN_1`, `WEBPOSTO_TOKEN_2`) |
+| `GERT_EMPRESAS` | `[1]` | Lista JSON de códigos de empresa. Ex: `[1,2]` para 2 empresas |
 | `GERT_TCP_PORT` | `6500` | Porta TCP do protocolo Gertec |
 | `GERT_DASH_PORT` | `8650` | Porta HTTP do dashboard |
-| `GERT_SERVER_IP` | `0.0.0.0` | IP exibido nas instruções do dashboard |
+| `GERT_SERVER_IP` | `0.0.0.0` | IP de escuta do servidor |
 | `GERT_SYNC_PRICES_SEC` | `300` | Intervalo de sync de preços (segundos) |
 | `GERT_SYNC_CATALOG_SEC` | `1800` | Intervalo de sync de catálogo (segundos) |
 | `GERT_GIF_ROTATION_SEC` | `30` | Intervalo de rotação de GIFs (segundos) |
@@ -66,8 +66,8 @@ cp .env.example .env
 | `GERT_LOG_DIR` | `./logs` | Diretório de logs |
 | `GERT_GIF_DIR` | `./gifs` | Diretório de GIFs de propaganda |
 | `G2E_ADMIN_USER` | `admin` | Usuário da interface web do G2E |
-| `G2E_ADMIN_PASS` | `admin` | Senha da interface web do G2E |
-| `WEBPOSTO_BASE_URL` | `https://web.qualityautomacao.com.br/INTEGRACAO` | URL base da API |
+| `G2E_ADMIN_PASS` | `admin` | Senha da interface web do G2E (mude em produção) |
+| `WEBPOSTO_BASE_URL` | `https://web.qualityautomacao.com.br/INTEGRACAO` | URL base da API WebPosto |
 
 ### Rodar
 
@@ -123,6 +123,40 @@ Acesse `http://<ip-servidor>:8650`:
 - `PRODUTO_EMPRESA` também ignora paginação por `codigo`; `limite=2000` é o máximo aceito (2.500 → HTTP 400). O filtro `grupoCodigo` retorna HTTP 400.
 - `PRODUTO_EMPRESA?produtoCodigo=X` funciona como filtro exato (1 resultado) — usado para lookup sob demanda.
 - A busca por nome (`?nome=TERMO`) não é confiável — retorna sempre os mesmos resultados.
+
+## Multi-empresa: pitfalls conhecidos
+
+### 1. Produto ativo em uma empresa, inativo em outra
+
+Um mesmo produto (mesmo `produtoCodigo`) pode estar **ativo com preço em uma empresa** e **inativo em outra**. O catálogo `PRODUTO` é compartilhado entre empresas, mas `PRODUTO_EMPRESA` tem dados independentes por empresa.
+
+**Sintoma:** um barcode consultado retorna "SEM PRECO" mesmo com preço cadastrado no ERP.
+
+**Causa:** o servidor indexa o barcode na última empresa onde o produto foi encontrado durante o sync de catálogo. Se a empresa indexada tem o produto inativo, o lookup retorna preço zero.
+
+**Solução implementada:** o lookup sob demanda (`fetch_price_on_demand`) agora tenta **todas as empresas configuradas** quando a empresa primária retorna preço zero. O primeiro preço > 0 encontrado é usado e cacheado.
+
+### 2. Cache negativo por empresa (⚠️ crítico — bug corrigido na v1.1)
+
+**Problema original:** o cache negativo (`no_price_confirmed`) era chaveado apenas por `produtoCodigo`, sem incluir a empresa. Quando a empresa A retornava `precoVenda=0, ativo=False`, o cache bloqueava consultas em **todas as outras empresas** por 1 hora — mesmo que o produto estivesse ativo com preço na empresa B.
+
+**Log de sintoma:**
+```
+On-demand: produtoCodigo=1878759 has no price (precoVenda=0, ativo=False)
+HIT (confirmed no price in all empresas): 7896054900341 -> XAROPE GROSELHA WILSON 900ML
+```
+
+**Correção (commit `505e10b`):** a chave do cache negativo mudou de `produtoCodigo` para `produtoCodigo_empresa`. Produto inativo na empresa A não bloqueia mais consultas na empresa B.
+
+**Se você usa versão anterior a `505e10b`, atualize:**
+```bash
+git pull origin main
+systemctl --user restart gertec-server.service
+```
+
+### 3. Progressive sync sem filtro de empresa
+
+O sync progressivo de preços também foi corrigido: antes só verificava produtos sem preço na empresa indexada. Agora verifica **todos os produtos sem preço em todas as empresas**, garantindo cobertura mesmo se o produto foi indexado à empresa errada.
 
 ## Protocolo TCP Gertec
 

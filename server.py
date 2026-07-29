@@ -19,14 +19,14 @@ from aiohttp import web
 # === CONFIG ===
 TCP_PORT = 6500
 DASH_PORT = int(os.environ.get("GERT_DASH_PORT", "8650"))
-SERVER_IP = os.environ.get("GERT_SERVER_IP", "192.168.1.113")
+SERVER_IP = os.environ.get("GERT_SERVER_IP", "0.0.0.0")
 WEBPOSTO_BASE = "https://web.qualityautomacao.com.br/INTEGRACAO"
 SYNC_PRICES_INTERVAL = 300
 SYNC_CATALOG_INTERVAL = 1800
 GIF_ROTATION_INTERVAL = 30
 LOG_DIR = Path(__file__).parent / "logs"
 GIF_DIR = Path(__file__).parent / "gifs"
-EMPRESAS = json.loads(os.environ.get("GERT_EMPRESAS", "[7806]"))
+EMPRESAS = json.loads(os.environ.get("GERT_EMPRESAS", "[1]"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -526,7 +526,7 @@ async def handle_terminal(reader, writer):
                 elif product:
                     # Product known but no price — try on-demand lookup across ALL empresas
                     pc = product.get("produtoCodigo")
-                    emp_primary = product.get("empresa", EMPRESAS[0] if EMPRESAS else 7806)
+                    emp_primary = product.get("empresa", EMPRESAS[0] if EMPRESAS else 1)
                     price = None
                     found_empresa = None
                     if pc:
