@@ -134,9 +134,13 @@ server → terminal:  b"#alwayslive" + dados do GIF (G2S) ou vazio (G2E)
 
 # Consulta
 terminal → server:  b"#7891234567890"  # barcode
-server → terminal:  b"#PRODUTO EXEMPLO|12.90"  # encontrado com preço
+server → terminal:  b"#PRODUTO EXEMPLO                                                |R$ 12,90"  # encontrado com preço
                   ou b"#PRODUTO EXEMPLO|SEM PRECO"  # encontrado sem preço
                   ou b"#nfound"  # barcode não cadastrado
+
+O campo do nome ocupa até **4 linhas de 20 colunas (80 bytes)**. O terminal
+faz a divisão visual em blocos de 20 colunas; não é necessário enviar `\\n`.
+O campo do preço ocupa uma linha de até 20 caracteres.
 
 # Keep-alive (após 120s sem dados)
 server → terminal:  b"#live?"
@@ -324,10 +328,13 @@ Terminal → Servidor:  #live
 
 ```
 Terminal → Servidor:  #7891234567890
-Servidor → Terminal:  #PRODUTO EXEMPLO|12.90
+Servidor → Terminal:  #PRODUTO EXEMPLO                                                |R$ 12,90
                   ou  #PRODUTO EXEMPLO|SEM PRECO
                   ou  #nfound
 ```
+
+O nome ocupa até 4 linhas de 20 colunas (80 bytes); o terminal faz a quebra
+visual em blocos de 20 colunas. O preço ocupa uma linha de até 20 caracteres.
 
 ### GIF (somente G2S)
 

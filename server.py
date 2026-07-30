@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import textwrap
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -401,7 +402,30 @@ async def sync_loop():
                 price_counter = 0
 
 
-# === GERT...===
+# === GERTEC PROTOCOL ===
+PRODUCT_NAME_LINE_WIDTH = 20
+PRODUCT_NAME_LINE_COUNT = 4
+PRODUCT_NAME_MAX_LENGTH = PRODUCT_NAME_LINE_WIDTH * PRODUCT_NAME_LINE_COUNT
+PRICE_MAX_LENGTH = 20
+
+
+def _format_product_name(nome):
+    """Fit a product name in the Gertec's 4 lines of 20 columns.
+
+    The price-query protocol does not use a literal newline. The terminal
+    renders the product field in 20-column chunks, so the field is padded to
+    80 bytes before the ``|`` separator.
+    """
+    text = " ".join(str(nome or "PRODUTO").replace("\r", " ").replace("\n", " ").split())
+    lines = textwrap.wrap(
+        text,
+        width=PRODUCT_NAME_LINE_WIDTH,
+        max_lines=PRODUCT_NAME_LINE_COUNT,
+        placeholder="...",
+    )
+    return "".join(line.ljust(PRODUCT_NAME_LINE_WIDTH) for line in lines).ljust(PRODUCT_NAME_MAX_LENGTH)
+
+
 def build_mesg(line1, line2, tempo=5):
     cmd = "#mesg"
     cmd += chr(len(line1) + 48) + line1
@@ -423,12 +447,14 @@ def build_gif_command(gif_data, index=0, loops=0, tempo=10):
 
 
 def format_price_response(nome, preco):
+    product_name = _format_product_name(nome)
     if preco is not None:
-        nome_short = nome[:20] if len(nome) <= 20 else nome[:17] + "..."
-        resp = f"#{nome_short}|{preco:.2f}"
+        # The terminal receives the price as text; include the currency
+        # symbol explicitly and use the Brazilian decimal separator.
+        price = f"R$ {preco:.2f}".replace(".", ",")
     else:
-        resp = f"#{nome[:20]}|SEM PRECO"
-    return resp.encode("ascii", errors="replace")
+        price = "SEM PRECO"
+    return f"#{product_name}|{price[:PRICE_MAX_LENGTH]}".encode("ascii", errors="replace")
 
 
 async def send_gif_to_terminal(writer, gif_path):
@@ -482,7 +508,7 @@ async def handle_terminal(reader, writer):
 
         if not is_g2e:
             # G2S: send welcome message + initial GIF
-            writer.write(build_mesg("POSTO SCURSEL", "CONSULTE AQUI!", 5))
+            writer.write(build_mesg("POSTO EXEMPLO", "CONSULTE AQUI!", 5))
             await writer.drain()
             state.stats["mesg_sends"] += 1
             gif_files = sorted(GIF_DIR.glob("*.gif"))
@@ -684,7 +710,7 @@ h2 {{ color: #c9d1d9; margin: 20px 0 10px; font-size: 1.1em; }}
 </head>
 <body>
 <h1>Gertec Busca Preco - Server</h1>
-<p class="subtitle">Posto Scursel | Uptime: {hours}h {mins}m | TCP {TCP_PORT} / HTTP {DASH_PORT}</p>
+<p class="subtitle">Posto Exemplo | Uptime: {hours}h {mins}m | TCP {TCP_PORT} / HTTP {DASH_PORT}</p>
 <section class="setup">
 <h2>Como configurar o terminal Gertec</h2>
 <p class="setup-intro">No menu de rede do Gertec, configure o servidor de consulta usando TCP:</p>
