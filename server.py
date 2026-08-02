@@ -78,6 +78,21 @@ def get_token(empresa):
     return os.environ.get(f"WEBPOSTO_TOKEN_{empresa}")
 
 
+def find_product_by_barcode(products, barcode):
+    """Find an exact barcode or its equivalent UPC-A/EAN-13 representation."""
+    product = products.get(barcode)
+    if product is not None:
+        return product
+
+    if not barcode.isdigit():
+        return None
+    if len(barcode) == 13 and barcode.startswith("0"):
+        return products.get(barcode[1:])
+    if len(barcode) == 12:
+        return products.get(f"0{barcode}")
+    return None
+
+
 async def sync_catalog(session):
     """Full catalog sync: GRUPO → PRODUTO per group (bypasses 2000-item limit)."""
     for empresa in EMPRESAS:
@@ -544,7 +559,7 @@ async def handle_terminal(reader, writer):
                 state.stats["total_queries"] += 1
                 state.connected_terminals[addr_str]["queries"] += 1
 
-                product = state.products.get(barcode)
+                product = find_product_by_barcode(state.products, barcode)
                 if product and product.get("preco") is not None:
                     state.stats["hits"] += 1
                     resp = format_price_response(product["nome"], product["preco"])
@@ -989,7 +1004,7 @@ async def dashboard_lookup(request):
     barcode = request.query.get("barcode", "").strip()
     if not barcode:
         return web.json_response({"error": "Parametro 'barcode' obrigatorio"}, status=400)
-    product = state.products.get(barcode)
+    product = find_product_by_barcode(state.products, barcode)
     if product:
         return web.json_response({"found": True, "barcode": barcode, **product})
     # Try by_codigo

@@ -8,6 +8,7 @@ from pathlib import Path
 # server.py creates its file logger during import.
 (Path(__file__).parent / "logs").mkdir(exist_ok=True)
 
+import server
 from server import format_price_response
 
 
@@ -45,6 +46,19 @@ class PriceResponseTests(unittest.TestCase):
 
         self.assertEqual(name_field[:20].strip(), "PRODUTO SEM PRECO")
         self.assertEqual(price_field, "SEM PRECO")
+
+
+class BarcodeLookupTests(unittest.TestCase):
+    def test_ean13_zero_prefix_matches_upca_catalog_entry(self):
+        product = {"nome": "ENERGY DRINK", "preco": 10.99}
+        products = {"012345678905": product}
+
+        finder = getattr(server, "find_product_by_barcode", None)
+        if finder is None:
+            self.fail(
+                "find_product_by_barcode must support GTIN-12/GTIN-13 equivalence"
+            )
+        self.assertIs(finder(products, "0012345678905"), product)
 
 
 if __name__ == "__main__":
