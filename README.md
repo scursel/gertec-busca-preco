@@ -15,7 +15,7 @@ Servidor Linux que substitui o app Java dos terminais de consulta **Gertec G2 / 
 ```
 
 1. **Sync catálogo** — busca `GRUPO` → `PRODUTO` por grupo na API WebPosto (bypass do limite de 2.000 itens por chamada)
-2. **Sync preços** — `PRODUTO_EMPRESA` bulk (2.000 mais recentes) a cada 5 min
+2. **Sync preços** — `PRODUTO_EMPRESA` bulk (até 2.000 registros; não são os mais recentes) a cada 5 min; os demais são revalidados por TTL no sync progressivo e sob demanda.
 3. **Lookup sob demanda** — quando o terminal bipa um produto sem preço no cache, o servidor busca na API em tempo real (~1s) e cacheia
 4. **Protocolo TCP** — handshake `#ok` → `#bpg2s`/`#bpg2e`, keep-alive `#alwayslive`, consulta `#<barcode>` → `#NOME|PRECO` ou `#nfound`
 5. **Propaganda** — GIFs rotativos em terminais G2S (via TCP `#gif`); mensagens de texto em G2E (via interface web do terminal)
@@ -51,7 +51,11 @@ WEBPOSTO_TOKEN_2=token-empresa-2
 GERT_EMPRESAS=[1,2]
 ```
 
-### 3. Executar localmente
+### 3. Vincular leitores às filiais e executar
+
+Copie `config/leitores.example.json` para `config/leitores.json` e configure o IP fixo de cada leitor e o código da empresa correspondente. Cada empresa deve estar em `GERT_EMPRESAS` e possuir seu próprio token no ambiente. Consulte [configuração por filial](FILIAIS.md).
+
+Valide antes de iniciar: `python3 server.py --check-config`. Configuração ausente/inválida impede a inicialização; leitores sem vínculo nunca recebem preços de outra filial.
 
 ```bash
 source .env

@@ -6,9 +6,12 @@ Substitui o app Java que roda no caixa.
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
+import re
+import sys
 import textwrap
 import time
 from datetime import datetime, timedelta
@@ -20,14 +23,22 @@ from aiohttp import web
 # === CONFIG ===
 TCP_PORT = 6500
 DASH_PORT = int(os.environ.get("GERT_DASH_PORT", "8650"))
-SERVER_IP = os.environ.get("GERT_SERVER_IP", "0.0.0.0")
+SERVER_IP = os.environ.get("GERT_SERVER_IP", "192.168.1.113")
 WEBPOSTO_BASE = "https://web.qualityautomacao.com.br/INTEGRACAO"
 SYNC_PRICES_INTERVAL = 300
 SYNC_CATALOG_INTERVAL = 1800
 GIF_ROTATION_INTERVAL = 30
+QUERY_LOG_HISTORY_LIMIT = 500
 LOG_DIR = Path(__file__).parent / "logs"
 GIF_DIR = Path(__file__).parent / "gifs"
-EMPRESAS = json.loads(os.environ.get("GERT_EMPRESAS", "[1]"))
+EMPRESAS = json.loads(os.environ.get("GERT_EMPRESAS", "[7806]"))  # universo permitido de empresas
+DEFAULT_LEITORES_CONFIG = Path(__file__).parent / "config" / "leitores.json"
+PRICE_TTL = int(os.environ.get("GERT_PRICE_TTL", "3600"))  # idade a partir da qual o preço é revalidado
+PRICE_STALE_MAX = int(os.environ.get("GERT_PRICE_STALE_MAX", "21600"))  # idade máxima de preço stale servido com API fora
+NO_PRICE_CACHE_TTL = 3600  # cache negativo por (produtoCodigo, empresa)
+PROGRESSIVE_DELAY = 0.1  # pausa entre chamadas do sync progressivo
+TERMINAL_NAO_CONFIGURADO = "TERMINAL NAO CONFIGURADO"
+CATALOGO_INDISPONIVEL = "CATALOGO INDISPONIVEL"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,17 +51,220 @@ logging.basicConfig(
 log = logging.getLogger("gertec")
 
 
+_LOG_LINE_RE = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) "
+    r"\[INFO\] (?P<message>.*)$"
+)
+_HIT_QUERY_RE = re.compile(
+    r"^HIT(?: \([^)]*\))?: (?P<barcode>\S+) -> "
+    r"(?P<nome>.*?)(?: R\$(?P<preco>\d+(?:\.\d+)?))?$"
+)
+_TERMINAL_END_RE = re.compile(
+    r"^Terminal (?P<terminal>.+?) (?:disconnected|connection lost)$"
+)
+
+
+def _parse_query_log_line(line, terminal="histórico"):
+    """Convert one persisted HIT/MISS line into a dashboard query entry."""
+    match = _LOG_LINE_RE.match(line.rstrip("\n"))
+    if not match:
+        return None
+
+    timestamp = datetime.strptime(
+        match.group("timestamp"), "%Y-%m-%d %H:%M:%S,%f"
+    ).isoformat(timespec="milliseconds")
+    message = match.group("message")
+
+    if message.startswith("MISS: "):
+        return {
+            "time": timestamp,
+            "barcode": message[6:].strip(),
+            "terminal": terminal,
+            "hit": False,
+            "nome": None,
+            "preco": None,
+        }
+
+    hit = _HIT_QUERY_RE.match(message)
+    if not hit:
+        return None
+
+    preco = hit.group("preco")
+    return {
+        "time": timestamp,
+        "barcode": hit.group("barcode"),
+        "terminal": terminal,
+        "hit": True,
+        "nome": hit.group("nome").strip(),
+        "preco": float(preco) if preco else None,
+    }
+
+
+def load_query_history():
+    """Load query events already written to the text log after a restart."""
+    log_path = LOG_DIR / "gertec-server.log"
+    if not log_path.exists():
+        return []
+
+    history = []
+    active_terminals = []
+    try:
+        with log_path.open(encoding="utf-8", errors="replace") as logfile:
+            for line in logfile:
+                parsed_line = _LOG_LINE_RE.match(line.rstrip("\n"))
+                if not parsed_line:
+                    continue
+                message = parsed_line.group("message")
+
+                if message.startswith("Terminal connected: "):
+                    terminal = message.split(": ", 1)[1]
+                    if terminal not in active_terminals:
+                        active_terminals.append(terminal)
+                    continue
+
+                ended = _TERMINAL_END_RE.match(message)
+                if ended:
+                    terminal = ended.group("terminal")
+                    if terminal in active_terminals:
+                        active_terminals.remove(terminal)
+                    continue
+
+                terminal = active_terminals[-1] if active_terminals else "histórico"
+                query = _parse_query_log_line(line, terminal)
+                if query:
+                    history.append(query)
+    except OSError as exc:
+        log.warning(f"Could not load query history: {exc}")
+
+    return history
+
+
+# === LEITOR CONFIG ===
+class ConfigInvalidaError(Exception):
+    """Configuração de leitores (IP -> empresa) inválida; o servidor não deve subir."""
+
+    def __init__(self, path, erros):
+        self.path = str(path)
+        self.erros = list(erros)
+        super().__init__(f"Config de leitores inválida ({self.path}): " + "; ".join(self.erros))
+
+
+_LEITOR_KEYS = {"empresa", "nome"}
+
+
+def leitores_config_path():
+    return Path(os.environ.get("GERT_LEITORES_CONFIG") or DEFAULT_LEITORES_CONFIG)
+
+
+def _empresas_permitidas():
+    permitidas = set()
+    for empresa in EMPRESAS:
+        try:
+            permitidas.add(int(empresa))
+        except (TypeError, ValueError):
+            continue
+    return permitidas
+
+
+def _validar_leitor_config(path, environ=None):
+    """Valida a config de leitores.
+
+    Retorna (config, erros). ``config`` traz os leitores que puderam ser lidos
+    (útil para o resumo do --check-config) mesmo quando há erros.
+    """
+    environ = os.environ if environ is None else environ
+    erros = []
+    leitores = {}
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"versao": None, "leitores": {}}, [f"arquivo não encontrado: {path}"]
+    except (OSError, UnicodeDecodeError) as exc:
+        return {"versao": None, "leitores": {}}, [f"não foi possível ler {path}: {exc}"]
+    except json.JSONDecodeError as exc:
+        return {"versao": None, "leitores": {}}, [f"JSON inválido: {exc}"]
+
+    if not isinstance(raw, dict):
+        return {"versao": None, "leitores": {}}, ["raiz do JSON precisa ser um objeto"]
+
+    versao = raw.get("versao", 1)
+    if versao != 1:
+        erros.append(f"versao não suportada: {versao!r} (esperado 1)")
+
+    raw_leitores = raw.get("leitores")
+    if not isinstance(raw_leitores, dict):
+        erros.append("campo 'leitores' ausente ou não é objeto")
+        raw_leitores = {}
+    elif not raw_leitores:
+        erros.append("campo 'leitores' vazio: nenhum leitor configurado")
+
+    permitidas = _empresas_permitidas()
+    for ip, entry in raw_leitores.items():
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+        except ValueError:
+            erros.append(f"leitor {ip!r}: chave não é um IPv4 válido")
+            continue
+        if ip_obj.version != 4:
+            erros.append(f"leitor {ip!r}: só IPv4 é aceito")
+            continue
+        if not isinstance(entry, dict):
+            erros.append(f"leitor {ip}: valor precisa ser objeto com 'empresa'")
+            continue
+        desconhecidas = sorted(set(entry) - _LEITOR_KEYS)
+        if desconhecidas:
+            erros.append(f"leitor {ip}: chave(s) desconhecida(s) {desconhecidas}")
+        empresa = entry.get("empresa")
+        if isinstance(empresa, bool) or not isinstance(empresa, int) or empresa <= 0:
+            erros.append(f"leitor {ip}: 'empresa' precisa ser inteiro > 0 (recebido {empresa!r})")
+            continue
+        nome = entry.get("nome")
+        if nome is not None and (not isinstance(nome, str) or not nome.strip()):
+            erros.append(f"leitor {ip}: 'nome' precisa ser string não vazia")
+            nome = None
+        if empresa not in permitidas:
+            erros.append(f"leitor {ip}: empresa {empresa} não está em GERT_EMPRESAS {sorted(permitidas)}")
+        if not environ.get(f"WEBPOSTO_TOKEN_{empresa}"):
+            erros.append(f"leitor {ip}: empresa {empresa} sem token WEBPOSTO_TOKEN_{empresa} no ambiente")
+        leitores[str(ip_obj)] = {"empresa": empresa, "nome": nome.strip() if nome else None}
+
+    return {"versao": versao, "leitores": leitores}, erros
+
+
+def load_leitor_config(path=None, environ=None):
+    """Carrega e valida a config IP do leitor -> empresa. Levanta ConfigInvalidaError."""
+    path = Path(path) if path else leitores_config_path()
+    config, erros = _validar_leitor_config(path, environ)
+    if erros:
+        raise ConfigInvalidaError(path, erros)
+    config["path"] = str(path)
+    return config
+
+
 # === STATE ===
+class EmpresaCache:
+    """Catálogo e preços de UMA empresa. Identidade de produto (barcode -> produto) é por filial."""
+
+    def __init__(self, empresa):
+        self.empresa = empresa
+        self.products = {}        # barcode -> {"nome", "produtoCodigo", "barcodes": [...], "updated_at"}
+        self.by_codigo = {}       # produtoCodigo -> {"nome", "barcode", "barcodes": [...], "updated_at"}
+        self.prices = {}          # produtoCodigo -> {"preco": float, "updated_at": ts}
+        self.barcode_preco = {}   # barcode -> {"preco": float, "updated_at": ts}
+        self.last_price_sync = 0
+        self.progressive_cursor = 0
+
+
 class ServerState:
     def __init__(self):
-        self.products = {}       # barcode -> {nome, preco, produtoCodigo, updated_at}
-        self.by_codigo = {}      # produtoCodigo -> {nome, preco, barcode, barcodes[]}
+        self.empresas = {}       # empresa -> EmpresaCache (catálogo + preços da empresa)
+        self.config = None       # resultado de load_leitor_config
+        self.config_errors = []
         self.last_price_sync = 0
         self.last_catalog_sync = 0
         self.sync_errors = []
         self.http_session = None  # shared aiohttp session for on-demand lookups
         self.no_price_confirmed = {}  # "produtoCodigo_empresa" -> timestamp (confirmed precoVenda=0 or inactive)
-        self.progressive_cursor = 0   # cursor for progressive price sync
         self.stats = {
             "total_queries": 0,
             "hits": 0,
@@ -63,14 +277,55 @@ class ServerState:
             "on_demand_no_price": 0,
             "on_demand_errors": 0,
             "progressive_synced": 0,
+            "unmapped_queries": 0,
+            "stale_served": 0,
             "started_at": time.time(),
         }
-        self.query_log = []
+        historical_queries = load_query_history()
+        self.query_log = historical_queries[-QUERY_LOG_HISTORY_LIMIT:]
+        self.stats["total_queries"] = len(historical_queries)
+        self.stats["hits"] = sum(1 for query in historical_queries if query["hit"])
+        self.stats["misses"] = sum(1 for query in historical_queries if not query["hit"])
         self.connected_terminals = {}
         self.terminal_writers = {}  # addr_str -> writer (for GIF push)
 
+    def leitores(self):
+        return (self.config or {}).get("leitores", {})
+
+    def config_empresas(self):
+        """Empresas efetivamente sincronizadas: as citadas por algum leitor."""
+        return sorted({leitor["empresa"] for leitor in self.leitores().values()})
+
 
 state = ServerState()
+
+
+def empresa_cache(state, empresa):
+    cache = state.empresas.get(empresa)
+    if cache is None:
+        cache = state.empresas[empresa] = EmpresaCache(empresa)
+    return cache
+
+
+def empresa_para_ip(state, ip):
+    leitor = state.leitores().get(ip)
+    return leitor["empresa"] if leitor else None
+
+
+def catalogo_totais(state):
+    """(barcodes, produtos) distintos somando os catálogos de todas as empresas (só contagem)."""
+    barcodes, produtos = set(), set()
+    for cache in state.empresas.values():
+        barcodes.update(cache.products)
+        produtos.update(cache.by_codigo)
+    return len(barcodes), len(produtos)
+
+
+def nome_filial(state, empresa):
+    for leitor in state.leitores().values():
+        if leitor["empresa"] == empresa and leitor.get("nome"):
+            return leitor["nome"]
+    return None
 
 
 # === WEBPOSTO SYNC ===
@@ -93,9 +348,80 @@ def find_product_by_barcode(products, barcode):
     return None
 
 
-async def sync_catalog(session):
-    """Full catalog sync: GRUPO → PRODUTO per group (bypasses 2000-item limit)."""
-    for empresa in EMPRESAS:
+async def api_get_json(session, endpoint, params, timeout):
+    """Único ponto de acesso à API WebPosto (seam substituível nos testes)."""
+    async with session.get(
+        f"{WEBPOSTO_BASE}/{endpoint}",
+        params=params,
+        timeout=aiohttp.ClientTimeout(total=timeout),
+    ) as resp:
+        return await resp.json()
+
+
+def _empresas_para_sync(empresas=None):
+    """Empresas a sincronizar: sempre restritas às citadas pela config de leitores."""
+    configuradas = state.config_empresas()
+    if empresas is None:
+        return configuradas
+    return [e for e in empresas if e in configuradas]
+
+
+def _item_ativo(item):
+    ativo = item.get("ativo", True)
+    if isinstance(ativo, str):
+        ativo = ativo.strip().lower() not in ("", "false", "0", "n", "nao", "não")
+    return bool(ativo)
+
+
+def _item_preco(item):
+    """Preço servível de um item PRODUTO_EMPRESA: só item ativo com precoVenda > 0."""
+    if not _item_ativo(item):
+        return None
+    try:
+        pv = float(item.get("precoVenda") or 0)
+    except (TypeError, ValueError):
+        return None
+    return pv if pv > 0 else None
+
+
+def _store_price(empresa, produto_codigo, price, now=None):
+    cache = empresa_cache(state, empresa)
+    entry = {"preco": price, "updated_at": time.time() if now is None else now}
+    cache.prices[produto_codigo] = entry
+    for bc in cache.by_codigo.get(produto_codigo, {}).get("barcodes", []):
+        cache.barcode_preco[bc] = entry
+    state.no_price_confirmed.pop(f"{produto_codigo}_{empresa}", None)
+
+
+def _drop_price(empresa, produto_codigo):
+    """Produto sem preço (inativo/zero) na empresa: remove preço e marca cache negativo."""
+    cache = empresa_cache(state, empresa)
+    cache.prices.pop(produto_codigo, None)
+    for bc in cache.by_codigo.get(produto_codigo, {}).get("barcodes", []):
+        cache.barcode_preco.pop(bc, None)
+    state.no_price_confirmed[f"{produto_codigo}_{empresa}"] = time.time()
+
+
+def _relink_barcode_prices(empresa):
+    """Após o catálogo da empresa, reaponta barcode -> preço dela (sem apagar preço)."""
+    cache = empresa_cache(state, empresa)
+    for pc, entry in cache.prices.items():
+        for bc in cache.by_codigo.get(pc, {}).get("barcodes", []):
+            cache.barcode_preco[bc] = entry
+
+
+def _no_price_cached(produto_codigo, empresa):
+    cached_at = state.no_price_confirmed.get(f"{produto_codigo}_{empresa}")
+    return bool(cached_at and (time.time() - cached_at) < NO_PRICE_CACHE_TTL)
+
+
+async def sync_catalog(session, empresas=None):
+    """Full catalog sync: GRUPO → PRODUTO per group (bypasses 2000-item limit).
+
+    O catálogo é POR EMPRESA (state.empresas[E].products/by_codigo): o mesmo barcode
+    pode apontar para produtoCodigo diferente em cada filial.
+    """
+    for empresa in _empresas_para_sync(empresas):
         token = get_token(empresa)
         if not token:
             log.warning(f"No token for empresa {empresa}")
@@ -103,12 +429,7 @@ async def sync_catalog(session):
         try:
             # Step 1: get all groups
             params = {"CHAVE": token, "empresaCodigo": empresa, "limite": 100}
-            async with session.get(
-                f"{WEBPOSTO_BASE}/GRUPO",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                data = await resp.json()
+            data = await api_get_json(session, "GRUPO", params, 30)
             groups = data.get("resultados", []) if isinstance(data, dict) else data
             if not groups:
                 log.warning(f"No groups found for empresa {empresa}")
@@ -126,12 +447,7 @@ async def sync_catalog(session):
                     "limite": 2000,
                     "grupoCodigo": gc,
                 }
-                async with session.get(
-                    f"{WEBPOSTO_BASE}/PRODUTO",
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=60),
-                ) as resp:
-                    data = await resp.json()
+                data = await api_get_json(session, "PRODUTO", params, 60)
                 if isinstance(data, list) and data and isinstance(data[0], str):
                     log.error(f"PRODUTO error (grupo {gc}): {data[0]}")
                     continue
@@ -147,31 +463,30 @@ async def sync_catalog(session):
                     seen.add(pc)
                     unique_items.append(item)
 
+            cache = empresa_cache(state, empresa)
             count = 0
+            now = time.time()
             for item in unique_items:
-                barras = item.get("produtoCodigoBarra", [])
+                barras = item.get("produtoCodigoBarra", []) or []
                 nome = item.get("nome", "PRODUTO")
                 pc = item.get("produtoCodigo") or item.get("codigo")
-                if barras:
-                    for b in barras:
-                        bc = b.get("codigoBarra", "")
-                        if bc:
-                            state.products[bc] = {
-                                "nome": nome,
-                                "produtoCodigo": pc,
-                                "empresa": empresa,
-                                "preco": state.products.get(bc, {}).get("preco"),
-                                "updated_at": time.time(),
-                            }
-                            count += 1
+                all_bcs = [b.get("codigoBarra", "") for b in barras if b.get("codigoBarra")]
+                for bc in all_bcs:
+                    cache.products[bc] = {
+                        "nome": nome,
+                        "produtoCodigo": pc,
+                        "barcodes": all_bcs,
+                        "updated_at": now,
+                    }
+                    count += 1
                 if pc:
-                    all_bcs = [b.get("codigoBarra", "") for b in barras if b.get("codigoBarra")]
-                    state.by_codigo[pc] = {
+                    cache.by_codigo[pc] = {
                         "nome": nome,
                         "barcode": all_bcs[0] if all_bcs else None,
                         "barcodes": all_bcs,
-                        "preco": state.by_codigo.get(pc, {}).get("preco"),
+                        "updated_at": now,
                     }
+            _relink_barcode_prices(empresa)
             state.last_catalog_sync = time.time()
             log.info(f"Catalog sync: {count} barcodes, {len(unique_items)} products, {len(groups)} groups (empresa {empresa})")
         except Exception as e:
@@ -180,9 +495,9 @@ async def sync_catalog(session):
             state.sync_errors.append(f"{datetime.now().isoformat()} {msg}")
 
 
-async def sync_prices(session):
-    """Sync prices from PRODUTO_EMPRESA — bulk fetch (max 2000) + on-demand for the rest."""
-    for empresa in EMPRESAS:
+async def sync_prices(session, empresas=None):
+    """Sync prices from PRODUTO_EMPRESA — bulk fetch (max 2000), gravado só na própria empresa."""
+    for empresa in _empresas_para_sync(empresas):
         token = get_token(empresa)
         if not token:
             continue
@@ -194,50 +509,57 @@ async def sync_prices(session):
                 "limite": 2000,
                 "codigo": 0,
             }
-            async with session.get(
-                f"{WEBPOSTO_BASE}/PRODUTO_EMPRESA",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
-                data = await resp.json()
+            data = await api_get_json(session, "PRODUTO_EMPRESA", params, 60)
             if isinstance(data, list) and data and isinstance(data[0], str):
                 log.error(f"PRODUTO_EMPRESA error: {data[0]}")
             else:
                 items = data.get("resultados", []) if isinstance(data, dict) else data
 
                 updated = 0
+                no_price = 0
+                now = time.time()
                 for item in items:
                     pc = item.get("produtoCodigo")
-                    pv = item.get("precoVenda", 0)
-                    if not pc or not pv or pv <= 0:
+                    if not pc:
                         continue
-                    price = float(pv)
-                    if pc in state.by_codigo:
-                        state.by_codigo[pc]["preco"] = price
-                        for bc in state.by_codigo[pc].get("barcodes", []):
-                            if bc and bc in state.products:
-                                state.products[bc]["preco"] = price
-                                updated += 1
-                        bc = state.by_codigo[pc].get("barcode")
-                        if bc and bc in state.products and state.products[bc].get("preco") != price:
-                            state.products[bc]["preco"] = price
-                            updated += 1
-                    else:
-                        state.by_codigo[pc] = {"nome": None, "barcode": None, "preco": price}
+                    price = _item_preco(item)
+                    if price is None:
+                        # Inativo ou precoVenda <= 0 nesta empresa: nunca servir preço.
+                        _drop_price(empresa, pc)
+                        no_price += 1
+                        continue
+                    _store_price(empresa, pc, price, now)
+                    updated += 1
 
-                state.last_price_sync = time.time()
-                log.info(f"Price sync (PRODUTO_EMPRESA): {len(items)} products, {updated} barcodes updated (empresa {empresa})")
+                cache = empresa_cache(state, empresa)
+                cache.last_price_sync = time.time()
+                state.last_price_sync = cache.last_price_sync
+                log.info(
+                    f"Price sync (PRODUTO_EMPRESA): {len(items)} products, {updated} priced, "
+                    f"{no_price} inactive/no-price (empresa {empresa})"
+                )
         except Exception as e:
             msg = f"Price sync error (empresa {empresa}): {e}"
             log.error(msg)
             state.sync_errors.append(f"{datetime.now().isoformat()} {msg}")
 
 
+async def _fetch_produto_empresa(session, token, produto_codigo, empresa):
+    params = {
+        "CHAVE": token,
+        "empresaCodigo": empresa,
+        "limite": 1,
+        "produtoCodigo": produto_codigo,
+    }
+    data = await api_get_json(session, "PRODUTO_EMPRESA", params, 10)
+    return data.get("resultados", []) if isinstance(data, dict) else data
+
+
 async def fetch_price_on_demand(produto_codigo, empresa):
-    """Fetch price for a single product via PRODUTO_EMPRESA?produtoCodigo=X.
+    """Fetch price for a single product via PRODUTO_EMPRESA?produtoCodigo=X, só na empresa dada.
 
     Returns:
-        float > 0  — price found and cached
+        float > 0  — price found and cached (state.empresas[empresa])
         0.0        — API confirmed no price (precoVenda=0 or inactive product)
         None       — API call failed (network error, timeout, etc.)
     """
@@ -246,98 +568,78 @@ async def fetch_price_on_demand(produto_codigo, empresa):
         return None
 
     # Negative cache: skip if we already confirmed no price for THIS empresa within the last hour
-    cache_key = f"{produto_codigo}_{empresa}"
-    cached_at = state.no_price_confirmed.get(cache_key)
-    if cached_at and (time.time() - cached_at) < 3600:
+    if _no_price_cached(produto_codigo, empresa):
         return 0.0
 
     try:
-        params = {
-            "CHAVE": token,
-            "empresaCodigo": empresa,
-            "limite": 1,
-            "produtoCodigo": produto_codigo,
-        }
-        async with state.http_session.get(
-            f"{WEBPOSTO_BASE}/PRODUTO_EMPRESA",
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            data = await resp.json()
-        items = data.get("resultados", []) if isinstance(data, dict) else data
+        items = await _fetch_produto_empresa(state.http_session, token, produto_codigo, empresa)
         if isinstance(items, list) and items and isinstance(items[0], str):
             # API returned an error string
-            log.warning(f"On-demand API error for {produto_codigo}: {items[0]}")
+            log.warning(f"On-demand API error for {produto_codigo} (empresa {empresa}): {items[0]}")
             state.stats["on_demand_errors"] += 1
             return None
         if items:
             item = items[0]
-            pv = item.get("precoVenda") or 0
-            ativo = item.get("ativo", True)
-            if pv and float(pv) > 0:
-                price = float(pv)
-                # Cache it
-                if produto_codigo in state.by_codigo:
-                    state.by_codigo[produto_codigo]["preco"] = price
-                    for bc in state.by_codigo[produto_codigo].get("barcodes", []):
-                        if bc and bc in state.products:
-                            state.products[bc]["preco"] = price
+            price = _item_preco(item)
+            if price is not None:
+                _store_price(empresa, produto_codigo, price)
                 state.stats["on_demand_lookups"] += 1
-                # Clear negative cache if it was there
-                state.no_price_confirmed.pop(cache_key, None)
-                log.info(f"On-demand price: produtoCodigo={produto_codigo} -> R${price:.2f}")
+                log.info(f"On-demand price: produtoCodigo={produto_codigo} empresa={empresa} -> R${price:.2f}")
                 return price
-            else:
-                # Product exists in ERP but has no sale price (inactive or zero price)
-                state.no_price_confirmed[cache_key] = time.time()
-                state.stats["on_demand_no_price"] += 1
-                log.info(f"On-demand: produtoCodigo={produto_codigo} has no price (precoVenda={pv}, ativo={ativo})")
-                return 0.0
-        else:
-            # Product not registered in PRODUTO_EMPRESA for this empresa
-            state.no_price_confirmed[cache_key] = time.time()
+            # Product exists in ERP but has no sale price here (inactive or zero price)
+            _drop_price(empresa, produto_codigo)
             state.stats["on_demand_no_price"] += 1
-            log.info(f"On-demand: produtoCodigo={produto_codigo} not found in PRODUTO_EMPRESA")
+            log.info(
+                f"On-demand: produtoCodigo={produto_codigo} has no price in empresa {empresa} "
+                f"(precoVenda={item.get('precoVenda')}, ativo={item.get('ativo', True)})"
+            )
             return 0.0
+        # Product not registered in PRODUTO_EMPRESA for this empresa
+        _drop_price(empresa, produto_codigo)
+        state.stats["on_demand_no_price"] += 1
+        log.info(f"On-demand: produtoCodigo={produto_codigo} not found in PRODUTO_EMPRESA (empresa {empresa})")
+        return 0.0
     except Exception as e:
         state.stats["on_demand_errors"] += 1
-        log.warning(f"On-demand price lookup failed for {produto_codigo}: {e}")
+        log.warning(f"On-demand price lookup failed for {produto_codigo} (empresa {empresa}): {e}")
     return None
-async def sync_prices_progressive(session):
+
+
+async def sync_prices_progressive(session, empresas=None):
     """Progressively fetch prices for products NOT covered by the bulk 2000.
 
-    Iterates through by_codigo entries that still have preco=None,
-    fetching prices in small batches to avoid overwhelming the API.
-    Runs inside sync_loop after each bulk sync.
+    Por empresa: cobre produtos sem preço nessa empresa e revalida preços cujo
+    updated_at passou de PRICE_TTL. Runs inside sync_loop after each bulk sync.
     """
     BATCH_SIZE = 200  # products per progressive cycle (~4h for full coverage)
     MAX_API_ERRORS = 5  # stop batch if too many consecutive errors
 
-    for empresa in EMPRESAS:
+    for empresa in _empresas_para_sync(empresas):
         token = get_token(empresa)
         if not token:
             continue
+        cache = empresa_cache(state, empresa)
 
-        # Collect ALL produtoCodigo entries without price (not just this empresa's)
-        # A product may be inactive in its indexed empresa but active in another
+        now = time.time()
         pending = []
-        for pc, info in state.by_codigo.items():
-            if info.get("preco") is None:
-                # Skip recently confirmed no-price (negative cache)
-                cached_at = state.no_price_confirmed.get(f"{pc}_{empresa}")
-                if cached_at and (time.time() - cached_at) < 3600:
-                    continue
-                pending.append(pc)
+        for pc in cache.by_codigo:
+            entry = cache.prices.get(pc)
+            if entry is not None and (now - entry["updated_at"]) < PRICE_TTL:
+                continue
+            # Skip recently confirmed no-price (negative cache)
+            if entry is None and _no_price_cached(pc, empresa):
+                continue
+            pending.append(pc)
 
         if not pending:
             continue
 
         # Take a batch starting from the cursor
-        cursor = state.progressive_cursor % max(len(pending), 1)
+        cursor = cache.progressive_cursor % max(len(pending), 1)
         batch = pending[cursor:cursor + BATCH_SIZE]
         if not batch:
             batch = pending[:BATCH_SIZE]
-        state.progressive_cursor = cursor + len(batch)
+        cache.progressive_cursor = cursor + len(batch)
 
         fetched = 0
         no_price = 0
@@ -346,51 +648,29 @@ async def sync_prices_progressive(session):
 
         for pc in batch:
             if consecutive_errors >= MAX_API_ERRORS:
-                log.warning(f"Progressive sync: stopping early after {consecutive_errors} consecutive errors")
+                log.warning(f"Progressive sync: stopping early after {consecutive_errors} consecutive errors (empresa {empresa})")
                 break
             try:
-                params = {
-                    "CHAVE": token,
-                    "empresaCodigo": empresa,
-                    "limite": 1,
-                    "produtoCodigo": pc,
-                }
-                async with session.get(
-                    f"{WEBPOSTO_BASE}/PRODUTO_EMPRESA",
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    data = await resp.json()
-                items = data.get("resultados", []) if isinstance(data, dict) else data
+                items = await _fetch_produto_empresa(session, token, pc, empresa)
                 if isinstance(items, list) and items and isinstance(items[0], str):
                     errors += 1
                     consecutive_errors += 1
                     continue
-                if items:
-                    pv = items[0].get("precoVenda") or 0
-                    if pv and float(pv) > 0:
-                        price = float(pv)
-                        if pc in state.by_codigo:
-                            state.by_codigo[pc]["preco"] = price
-                            for bc in state.by_codigo[pc].get("barcodes", []):
-                                if bc and bc in state.products:
-                                    state.products[bc]["preco"] = price
-                        fetched += 1
-                        state.no_price_confirmed.pop(f"{pc}_{empresa}", None)
-                    else:
-                        state.no_price_confirmed[f"{pc}_{empresa}"] = time.time()
-                        no_price += 1
+                price = _item_preco(items[0]) if items else None
+                if price is not None:
+                    _store_price(empresa, pc, price)
+                    fetched += 1
                 else:
-                    state.no_price_confirmed[f"{pc}_{empresa}"] = time.time()
+                    _drop_price(empresa, pc)
                     no_price += 1
                 consecutive_errors = 0
             except Exception as e:
                 errors += 1
                 consecutive_errors += 1
-                log.debug(f"Progressive sync error for {pc}: {e}")
+                log.debug(f"Progressive sync error for {pc} (empresa {empresa}): {e}")
 
             # Small delay to be gentle on the API
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(PROGRESSIVE_DELAY)
 
         state.stats["progressive_synced"] += fetched
         if fetched or no_price or errors:
@@ -487,18 +767,92 @@ async def send_gif_to_terminal(writer, gif_path):
         return False
 
 
+async def consulta_preco(ip, barcode):
+    """Resolve uma consulta do leitor ``ip`` usando SOMENTE a empresa vinculada a ele.
+
+    Retorna dict com: resp (bytes do protocolo), empresa, product, preco, status.
+    status ∈ {"unmapped", "miss", "hit", "hit_ondemand", "hit_revalidated",
+              "hit_stale", "no_price", "lookup_failed"}.
+    """
+    empresa = empresa_para_ip(state, ip)
+    if empresa is None:
+        # Falha fechada: nenhuma empresa é consultada, nenhum preço é exibido.
+        log.warning(f"Leitor sem vínculo de filial: ip={ip} barcode={barcode} — respondendo sem preço")
+        return {
+            "resp": format_price_response(TERMINAL_NAO_CONFIGURADO, None),
+            "empresa": None, "product": None, "nome": None, "preco": None, "status": "unmapped",
+        }
+
+    # Identidade do produto vem SÓ do catálogo da empresa do leitor (nunca de outra filial).
+    cache = empresa_cache(state, empresa)
+    if not cache.products:
+        # Catálogo desta empresa ainda não sincronizou: não dá para afirmar "não encontrado"
+        # nem usar o catálogo de outra filial. Sem preço, sem nome, sem chamada de API.
+        log.warning(f"Catalogo da empresa {empresa} indisponivel: ip={ip} barcode={barcode} — respondendo sem preço")
+        return {
+            "resp": format_price_response(CATALOGO_INDISPONIVEL, None),
+            "empresa": empresa, "product": None, "nome": None, "preco": None, "status": "lookup_failed",
+        }
+    product = find_product_by_barcode(cache.products, barcode)
+    if product is None:
+        return {"resp": b"#nfound", "empresa": empresa, "product": None, "nome": None,
+                "preco": None, "status": "miss"}
+
+    nome = product["nome"]
+    pc = product.get("produtoCodigo")
+    entry = cache.prices.get(pc) if pc else None
+    if entry is None:
+        entry = cache.barcode_preco.get(barcode)
+
+    def result(preco, status):
+        return {
+            "resp": format_price_response(nome, preco),
+            "empresa": empresa, "product": product, "nome": nome, "preco": preco, "status": status,
+        }
+
+    if entry is not None:
+        age = time.time() - entry["updated_at"]
+        if age < PRICE_TTL:
+            return result(entry["preco"], "hit")
+        price = await fetch_price_on_demand(pc, empresa) if pc else None
+        if price is not None and price > 0:
+            return result(price, "hit_revalidated")
+        if price == 0.0:
+            return result(None, "no_price")
+        # API fora: stale da MESMA empresa, só dentro da janela
+        if age < PRICE_STALE_MAX:
+            state.stats["stale_served"] += 1
+            log.warning(f"Serving stale price (age {int(age)}s, empresa {empresa}) for {barcode}")
+            return result(entry["preco"], "hit_stale")
+        return result(None, "lookup_failed")
+
+    price = await fetch_price_on_demand(pc, empresa) if pc else None
+    if price is not None and price > 0:
+        return result(price, "hit_ondemand")
+    if price == 0.0:
+        return result(None, "no_price")
+    return result(None, "lookup_failed")
+
+
 async def handle_terminal(reader, writer):
     addr = writer.get_extra_info("peername")
     addr_str = f"{addr[0]}:{addr[1]}" if addr else "unknown"
+    ip = addr[0] if addr else None
+    empresa = empresa_para_ip(state, ip)
     state.stats["connections"] += 1
     state.stats["active_connections"] += 1
     state.connected_terminals[addr_str] = {
         "connected_at": datetime.now().isoformat(),
         "queries": 0,
         "model": "unknown",
+        "ip": ip,
+        "empresa": empresa,
+        "filial": nome_filial(state, empresa) if empresa else None,
     }
     state.terminal_writers[addr_str] = writer
     log.info(f"Terminal connected: {addr_str}")
+    if empresa is None:
+        log.warning(f"Terminal {addr_str} sem vínculo em config de leitores — consultas sem preço")
 
     try:
         # Handshake
@@ -523,7 +877,7 @@ async def handle_terminal(reader, writer):
 
         if not is_g2e:
             # G2S: send welcome message + initial GIF
-            writer.write(build_mesg("POSTO EXEMPLO", "CONSULTE AQUI!", 5))
+            writer.write(build_mesg("POSTO SCURSEL", "CONSULTE AQUI!", 5))
             await writer.drain()
             state.stats["mesg_sends"] += 1
             gif_files = sorted(GIF_DIR.glob("*.gif"))
@@ -559,51 +913,31 @@ async def handle_terminal(reader, writer):
                 state.stats["total_queries"] += 1
                 state.connected_terminals[addr_str]["queries"] += 1
 
-                product = find_product_by_barcode(state.products, barcode)
-                if product and product.get("preco") is not None:
+                result = await consulta_preco(ip, barcode)
+                product = result["product"]
+                status = result["status"]
+                resp = result["resp"]
+                emp = result["empresa"]
+                if status == "unmapped":
+                    state.stats["misses"] += 1
+                    state.stats["unmapped_queries"] += 1
+                elif status == "miss":
+                    state.stats["misses"] += 1
+                    log.info(f"MISS: {barcode}")
+                elif product is None:
+                    state.stats["misses"] += 1
+                    log.warning(f"SEM CATALOGO (emp={emp}): {barcode} -> sem preço")
+                else:
                     state.stats["hits"] += 1
-                    resp = format_price_response(product["nome"], product["preco"])
-                    log.info(f"HIT: {barcode} -> {product['nome']} R${product['preco']:.2f}")
-                elif product:
-                    # Product known but no price — try on-demand lookup across ALL empresas
-                    pc = product.get("produtoCodigo")
-                    emp_primary = product.get("empresa", EMPRESAS[0] if EMPRESAS else 1)
-                    price = None
-                    found_empresa = None
-                    if pc:
-                        # Try primary empresa first
-                        price = await fetch_price_on_demand(pc, emp_primary)
-                        if price is not None and price > 0:
-                            found_empresa = emp_primary
-                        else:
-                            # Product may be inactive in primary empresa but active in another
-                            for alt_emp in EMPRESAS:
-                                if alt_emp == emp_primary:
-                                    continue
-                                price = await fetch_price_on_demand(pc, alt_emp)
-                                if price is not None and price > 0:
-                                    found_empresa = alt_emp
-                                    break
-                    if price is not None and price > 0:
-                        product["preco"] = price
-                        product["empresa"] = found_empresa
-                        state.stats["hits"] += 1
-                        resp = format_price_response(product["nome"], price)
-                        log.info(f"HIT (on-demand emp={found_empresa}): {barcode} -> {product['nome']} R${price:.2f}")
-                    elif price == 0.0:
-                        # Confirmed: product has no price in ANY empresa
-                        state.stats["hits"] += 1
-                        resp = format_price_response(product["nome"], None)
-                        log.info(f"HIT (confirmed no price in all empresas): {barcode} -> {product['nome']}")
+                    if result["preco"] is not None:
+                        tag = {"hit": "", "hit_ondemand": "on-demand ",
+                               "hit_revalidated": "revalidated ", "hit_stale": "stale "}[status]
+                        log.info(f"HIT ({tag}emp={emp}): {barcode} -> {product['nome']} R${result['preco']:.2f}")
+                    elif status == "no_price":
+                        log.info(f"HIT (no price emp={emp}): {barcode} -> {product['nome']}")
                     else:
                         # API call failed — show SEM PRECO but will retry on next bip
-                        state.stats["hits"] += 1
-                        resp = format_price_response(product["nome"], None)
-                        log.warning(f"HIT (lookup failed, will retry): {barcode} -> {product['nome']}")
-                else:
-                    state.stats["misses"] += 1
-                    resp = b"#nfound"
-                    log.info(f"MISS: {barcode}")
+                        log.warning(f"HIT (lookup failed, will retry emp={emp}): {barcode} -> {product['nome']}")
 
                 state.query_log.append({
                     "time": datetime.now().isoformat(),
@@ -611,7 +945,8 @@ async def handle_terminal(reader, writer):
                     "terminal": addr_str,
                     "hit": product is not None,
                     "nome": product["nome"] if product else None,
-                    "preco": product.get("preco") if product else None,
+                    "preco": result["preco"],
+                    "empresa": emp,
                 })
                 if len(state.query_log) > 500:
                     state.query_log = state.query_log[-200:]
@@ -678,13 +1013,20 @@ async def dashboard_index(request):
     for q in reversed(state.query_log[-50:]):
         status = "HIT" if q["hit"] else "MISS"
         preco = f"R$ {q['preco']:.2f}" if q.get("preco") else "-"
-        queries_html += f"<tr><td>{q['time'][11:19]}</td><td>{q['barcode']}</td><td>{q.get('nome') or '-'}</td><td>{preco}</td><td>{status}</td><td>{q['terminal']}</td></tr>"
+        query_time = datetime.fromisoformat(q["time"]).strftime("%d/%m/%Y %H:%M:%S")
+        queries_html += f"<tr><td>{query_time}</td><td>{q['barcode']}</td><td>{q.get('nome') or '-'}</td><td>{preco}</td><td>{status}</td><td>{q['terminal']}</td></tr>"
+
+    leitores_txt = ", ".join(
+        f"{ip} → {l['empresa']}" + (f" ({l['nome']})" if l.get("nome") else "")
+        for ip, l in state.leitores().items()
+    ) or "nenhum"
 
     errors_html = ""
     for e in state.sync_errors[-10:]:
         errors_html += f"<li>{e}</li>"
 
     last_price = datetime.fromtimestamp(state.last_price_sync).strftime("%H:%M:%S") if state.last_price_sync else "nunca"
+    total_barcodes, _ = catalogo_totais(state)
     last_catalog = datetime.fromtimestamp(state.last_catalog_sync).strftime("%H:%M:%S") if state.last_catalog_sync else "nunca"
 
     html = f"""<!DOCTYPE html>
@@ -725,7 +1067,7 @@ h2 {{ color: #c9d1d9; margin: 20px 0 10px; font-size: 1.1em; }}
 </head>
 <body>
 <h1>Gertec Busca Preco - Server</h1>
-<p class="subtitle">Posto Exemplo | Uptime: {hours}h {mins}m | TCP {TCP_PORT} / HTTP {DASH_PORT}</p>
+<p class="subtitle">Posto Scursel | Uptime: {hours}h {mins}m | TCP {TCP_PORT} / HTTP {DASH_PORT}</p>
 <section class="setup">
 <h2>Como configurar o terminal Gertec</h2>
 <p class="setup-intro">No menu de rede do Gertec, configure o servidor de consulta usando TCP:</p>
@@ -742,7 +1084,7 @@ h2 {{ color: #c9d1d9; margin: 20px 0 10px; font-size: 1.1em; }}
 <div class="card"><div class="label">Hits</div><div class="value green">{state.stats['hits']}</div></div>
 <div class="card"><div class="label">Misses</div><div class="value red">{state.stats['misses']}</div></div>
 <div class="card"><div class="label">Terminais Ativos</div><div class="value">{state.stats['active_connections']}</div></div>
-<div class="card"><div class="label">Produtos em Cache</div><div class="value">{len(state.products)}</div></div>
+<div class="card"><div class="label">Produtos em Cache</div><div class="value">{total_barcodes}</div></div>
 <div class="card"><div class="label">Ultimo Sync Preco</div><div class="value" style="font-size:1.2em">{last_price}</div></div>
 </div>
 <h2>Terminais Conectados</h2>
@@ -750,13 +1092,14 @@ h2 {{ color: #c9d1d9; margin: 20px 0 10px; font-size: 1.1em; }}
 {terminals_html or '<tr><td colspan="4" style="color:#8b949e">Nenhum terminal conectado</td></tr>'}
 </table>
 <h2>Ultimas Consultas</h2>
-<table><tr><th>Hora</th><th>Barcode</th><th>Produto</th><th>Preco</th><th>Status</th><th>Terminal</th></tr>
+<table><tr><th>Data/Hora</th><th>Barcode</th><th>Produto</th><th>Preco</th><th>Status</th><th>Terminal</th></tr>
 {queries_html or '<tr><td colspan="6" style="color:#8b949e">Nenhuma consulta ainda</td></tr>'}
 </table>
 <h2>Sync / Erros</h2>
 <div class="errors"><ul>
-<li style="color:#3fb950">Catalogo: {last_catalog} ({len(state.products)} barcodes)</li>
+<li style="color:#3fb950">Catalogo: {last_catalog} ({total_barcodes} barcodes)</li>
 <li style="color:#3fb950">Precos: {last_price}</li>
+<li style="color:#3fb950">Leitores: {leitores_txt}</li>
 {errors_html or '<li style="color:#8b949e">Sem erros</li>'}
 </ul></div>
 <h2>Propaganda (GIFs) — somente G2S</h2>
@@ -869,15 +1212,30 @@ async function doLookup() {{
 
 
 async def dashboard_api(request):
+    priced = set()
+    empresas = {}
+    for codigo in sorted(set(state.config_empresas()) | set(state.empresas)):
+        cache = empresa_cache(state, codigo)
+        priced.update(cache.prices)
+        empresas[str(codigo)] = {
+            "catalogo_barcodes": len(cache.products),
+            "catalogo_produtos": len(cache.by_codigo),
+            "produtos": len(cache.prices),
+            "precos": len(cache.barcode_preco),
+            "last_price_sync": cache.last_price_sync,
+        }
+    total_barcodes, total_produtos = catalogo_totais(state)
     return web.json_response({
         "stats": state.stats,
         "cache": {
-            "products": len(state.products),
-            "by_codigo": len(state.by_codigo),
-            "with_price": sum(1 for v in state.by_codigo.values() if v.get("preco") and v["preco"] > 0),
+            "products": total_barcodes,
+            "by_codigo": total_produtos,
+            "with_price": len(priced),
             "last_price_sync": state.last_price_sync,
             "last_catalog_sync": state.last_catalog_sync,
         },
+        "empresas": empresas,
+        "leitores": state.leitores(),
         "terminals": state.connected_terminals,
         "recent_queries": state.query_log[-20:],
         "errors": state.sync_errors[-5:],
@@ -999,30 +1357,109 @@ async def g2e_set_messages(request):
         return web.json_response({"error": str(e)}, status=502)
 
 
+def _lookup_empresa(query):
+    """Resolve a empresa do /lookup. Retorna (empresa, filial, erro_response)."""
+    leitores = state.leitores()
+    opcoes = [{"ip": ip, "empresa": l["empresa"], "nome": l.get("nome")} for ip, l in leitores.items()]
+    ip = query.get("ip", "").strip()
+    empresa_raw = query.get("empresa", "").strip()
+    if ip:
+        leitor = leitores.get(ip)
+        if not leitor:
+            return None, None, web.json_response(
+                {"error": f"IP {ip} sem vinculo de filial", "opcoes": opcoes}, status=404)
+        return leitor["empresa"], leitor.get("nome"), None
+    if empresa_raw:
+        try:
+            empresa = int(empresa_raw)
+        except ValueError:
+            empresa = None
+        if empresa not in state.config_empresas():
+            return None, None, web.json_response(
+                {"error": f"Empresa {empresa_raw} nao configurada", "opcoes": opcoes}, status=400)
+        return empresa, nome_filial(state, empresa), None
+    if len(leitores) == 1:
+        leitor = next(iter(leitores.values()))
+        return leitor["empresa"], leitor.get("nome"), None
+    return None, None, web.json_response(
+        {"error": "Informe 'empresa' ou 'ip' (mais de um leitor configurado)" if leitores
+         else "Nenhum leitor configurado", "opcoes": opcoes}, status=400)
+
+
+def _lookup_preco(empresa, produto_codigo, barcode=None):
+    cache = empresa_cache(state, empresa)
+    entry = cache.prices.get(produto_codigo) if produto_codigo else None
+    if entry is None and barcode:
+        entry = cache.barcode_preco.get(barcode)
+    if entry is None:
+        return {"preco": None, "preco_idade_s": None}
+    return {"preco": entry["preco"], "preco_idade_s": int(time.time() - entry["updated_at"])}
+
+
 async def dashboard_lookup(request):
-    """Diagnostic: look up a barcode in the cache."""
+    """Diagnostic: look up a barcode in the cache of ONE empresa."""
     barcode = request.query.get("barcode", "").strip()
     if not barcode:
         return web.json_response({"error": "Parametro 'barcode' obrigatorio"}, status=400)
-    product = find_product_by_barcode(state.products, barcode)
+    empresa, filial, error = _lookup_empresa(request.query)
+    if error is not None:
+        return error
+    scope = {"empresa": empresa, "filial": filial}
+    # Catálogo e preço SÓ da empresa escolhida: nunca nome/preço de outra filial.
+    cache = empresa_cache(state, empresa)
+    product = find_product_by_barcode(cache.products, barcode)
     if product:
-        return web.json_response({"found": True, "barcode": barcode, **product})
+        return web.json_response({"found": True, "barcode": barcode, **product, **scope,
+                                  **_lookup_preco(empresa, product.get("produtoCodigo"), barcode)})
     # Try by_codigo
-    by_code = state.by_codigo.get(barcode)
+    pc = int(barcode) if barcode.isdigit() and int(barcode) in cache.by_codigo else barcode
+    by_code = cache.by_codigo.get(pc)
     if by_code:
-        return web.json_response({"found": True, "type": "by_codigo", "codigo": barcode, **by_code})
-    return web.json_response({"found": False, "barcode": barcode,
-                              "total_products": len(state.products),
-                              "total_by_codigo": len(state.by_codigo)})
+        return web.json_response({"found": True, "type": "by_codigo", "codigo": barcode, **by_code, **scope,
+                                  **_lookup_preco(empresa, pc)})
+    return web.json_response({"found": False, "barcode": barcode, **scope,
+                              "total_products": len(cache.products),
+                              "total_by_codigo": len(cache.by_codigo)})
 
 
 # === MAIN ===
+def check_config():
+    """--check-config: valida config de leitores + tokens sem abrir TCP/dashboard."""
+    path = leitores_config_path()
+    config, erros = _validar_leitor_config(path)
+    print(f"Config de leitores: {path}")
+    print(f"GERT_EMPRESAS (permitidas): {sorted(_empresas_permitidas())}")
+    for ip, leitor in config["leitores"].items():
+        token = "presente" if get_token(leitor["empresa"]) else "AUSENTE"
+        print(f"  {ip} -> empresa {leitor['empresa']} -> {leitor.get('nome') or '-'} (token: {token})")
+    empresas = sorted({l["empresa"] for l in config["leitores"].values()})
+    print(f"Empresas sincronizadas: {empresas}")
+    if erros:
+        for erro in erros:
+            print(f"ERRO: {erro}")
+        print("RESULTADO: INVALIDA — o servidor NAO inicia com esta config")
+        return 1
+    print("RESULTADO: OK")
+    return 0
+
+
 async def main():
     LOG_DIR.mkdir(exist_ok=True)
     GIF_DIR.mkdir(exist_ok=True)
 
+    try:
+        state.config = load_leitor_config()
+    except ConfigInvalidaError as exc:
+        state.config_errors = exc.erros
+        log.error(f"Config de leitores INVALIDA em {exc.path}: {'; '.join(exc.erros)} — servidor NAO iniciado")
+        raise SystemExit(2)
+
     log.info(f"Starting Gertec Server - TCP:{TCP_PORT} HTTP:{DASH_PORT}")
-    log.info(f"Empresas: {EMPRESAS}")
+    log.info(f"Empresas permitidas (GERT_EMPRESAS): {EMPRESAS}")
+    log.info(f"Config de leitores: {state.config['path']}")
+    for ip, leitor in state.leitores().items():
+        log.info(f"Leitor {ip} -> empresa {leitor['empresa']} ({leitor.get('nome') or '-'})")
+    log.info(f"Empresas sincronizadas: {state.config_empresas()}")
 
     tcp_server = await asyncio.start_server(handle_terminal, "0.0.0.0", TCP_PORT)
     log.info(f"TCP server listening on 0.0.0.0:{TCP_PORT}")
@@ -1050,4 +1487,6 @@ async def main():
 
 
 if __name__ == "__main__":
+    if "--check-config" in sys.argv[1:]:
+        sys.exit(check_config())
     asyncio.run(main())

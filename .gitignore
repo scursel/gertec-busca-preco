@@ -1,6 +1,10 @@
 # Environment
 .env
 *.env.local
+config/leitores.json
+config/filial-operacional.env
+backups/
+implementation-filial/
 
 # Python
 __pycache__/

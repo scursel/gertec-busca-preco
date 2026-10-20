@@ -1,0 +1,6 @@
+{
+  "versao": 1,
+  "leitores": {
+    "192.0.2.10": {"empresa": 1, "nome": "Filial exemplo"}
+  }
+}
